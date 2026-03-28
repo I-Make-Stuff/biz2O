@@ -1,0 +1,373 @@
+name: constitutional-platform
+
+services:
+  # -----------------------------
+  # Databases / Infra
+  # -----------------------------
+  postgres:
+    image: postgres:18.1-bookworm
+    container_name: platform-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: platform
+      POSTGRES_USER: platform
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      # Optional: tune for local dev
+      # POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [platform]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform -d platform"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:8.4.0-bookworm
+    container_name: platform-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --save 60 1
+      --loglevel notice
+      --protected-mode yes
+      --requirepass ${REDIS_PASSWORD:?set in .env}
+    volumes:
+      - redis_data:/data
+    networks: [platform]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set in .env}
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-10-15T17-29-55Z
+    container_name: platform-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set in .env}
+      # Optional: set region for S3 compatibility
+      MINIO_REGION_NAME: us-east-1
+    volumes:
+      - minio_data:/data
+    networks: [platform]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # Console
+
+  keycloak:
+    image: keycloak/keycloak:26.4.0
+    container_name: platform-keycloak
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:?set in .env}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set in .env}
+
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?set in .env}
+
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+      KC_PROXY_HEADERS: xforwarded
+      KC_LOG_LEVEL: INFO
+
+      # So the realm json can reference env vars (client secret)
+      KEYCLOAK_PLATFORM_SERVICES_CLIENT_SECRET: ${KEYCLOAK_PLATFORM_SERVICES_CLIENT_SECRET:?set in .env}
+    volumes:
+      - ./infra/keycloak:/opt/keycloak/data/import:ro
+    networks: [platform]
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /health/ready HTTP/1.1\r\nhost: localhost\r\n\r\n' >&3 && cat <&3 | grep -q '200'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # Keycloak requires its own DB/schema. We'll create it in Postgres via init.
+  # This runs once at startup (idempotent-ish).
+  postgres-init:
+    image: postgres:18.1-bookworm
+    container_name: platform-postgres-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [platform]
+    restart: "no"
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >
+      psql -h postgres -U platform -d platform -v ON_ERROR_STOP=1
+      -c "DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'keycloak') THEN
+              CREATE ROLE keycloak LOGIN PASSWORD '${KEYCLOAK_DB_PASSWORD}';
+            END IF;
+          END $$;"
+      -c "SELECT 'keycloak role ok' AS status;"
+      -c "DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'keycloak') THEN
+              CREATE DATABASE keycloak OWNER keycloak;
+            END IF;
+          END $$;"
+      -c "SELECT 'keycloak db ok' AS status;"
+
+  # -----------------------------
+  # API Gateway (edge)
+  # -----------------------------
+  gateway:
+    image: traefik:v3.1
+    container_name: platform-gateway
+    restart: unless-stopped
+    networks: [platform]
+    ports:
+      - "80:80"
+      - "8081:8080" # Traefik dashboard (lock down in prod)
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      # Basic sane timeouts
+      - "--entrypoints.web.transport.respondingtimeouts.readtimeout=30s"
+      - "--entrypoints.web.transport.respondingtimeouts.writetimeout=30s"
+      - "--entrypoints.web.transport.respondingtimeouts.idletimeout=60s"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  # -----------------------------
+  # Platform Services (placeholders)
+  # -----------------------------
+  governance:
+    build:
+      context: ./services/governance
+      dockerfile: Dockerfile
+    container_name: platform-governance
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [platform]
+    environment:
+      ORG_DEFAULT_MODE: founder-managed
+      DATABASE_URL: postgres://platform:${POSTGRES_PASSWORD}@postgres:5432/platform
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://keycloak:8080/realms/platform}
+      SERVICE_NAME: governance
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.governance.rule=PathPrefix(`/governance`)"
+      - "traefik.http.routers.governance.entrypoints=web"
+
+  policy:
+    build:
+      context: ./services/policy
+      dockerfile: Dockerfile
+    container_name: platform-policy
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [platform]
+    environment:
+      DATABASE_URL: postgres://platform:${POSTGRES_PASSWORD}@postgres:5432/platform
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://keycloak:8080/realms/platform}
+      SERVICE_NAME: policy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.policy.rule=PathPrefix(`/policy`)"
+      - "traefik.http.routers.policy.entrypoints=web"
+
+  tasks:
+    build:
+      context: ./services/tasks
+      dockerfile: Dockerfile
+    container_name: platform-tasks
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks: [platform]
+    environment:
+      DATABASE_URL: postgres://platform:${POSTGRES_PASSWORD}@postgres:5432/platform
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: submissions
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://keycloak:8080/realms/platform}
+      SERVICE_NAME: tasks
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.tasks.rule=PathPrefix(`/tasks`)"
+      - "traefik.http.routers.tasks.entrypoints=web"
+
+  ledger:
+    build:
+      context: ./services/ledger
+      dockerfile: Dockerfile
+    container_name: platform-ledger
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [platform]
+    environment:
+      DATABASE_URL: postgres://platform:${POSTGRES_PASSWORD}@postgres:5432/platform
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://keycloak:8080/realms/platform}
+      SERVICE_NAME: ledger
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ledger.rule=PathPrefix(`/ledger`)"
+      - "traefik.http.routers.ledger.entrypoints=web"
+
+  distributions:
+    build:
+      context: ./services/distributions
+      dockerfile: Dockerfile
+    container_name: platform-distributions
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [platform]
+    environment:
+      DATABASE_URL: postgres://platform:${POSTGRES_PASSWORD}@postgres:5432/platform
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://keycloak:8080/realms/platform}
+      SERVICE_NAME: distributions
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.distributions.rule=PathPrefix(`/distributions`)"
+      - "traefik.http.routers.distributions.entrypoints=web"
+
+  audit:
+    build:
+      context: ./services/audit
+      dockerfile: Dockerfile
+    container_name: platform-audit
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [platform]
+    environment:
+      DATABASE_URL: postgres://platform:${POSTGRES_PASSWORD}@postgres:5432/platform
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://keycloak:8080/realms/platform}
+      SERVICE_NAME: audit
+      ANCHOR_ENABLED: ${ANCHOR_ENABLED:-false}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.audit.rule=PathPrefix(`/audit`)"
+      - "traefik.http.routers.audit.entrypoints=web"
+
+  # -----------------------------
+  # Bootstrap: create MinIO bucket(s)
+  # -----------------------------
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z-cpuv1
+    container_name: platform-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks: [platform]
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc mb -p local/submissions || true &&
+      mc anonymous set download local/submissions || true &&
+      echo "minio bucket init ok"
+
+  # -----------------------------
+  # Observability (optional)
+  # Enable with: docker compose --profile observability up
+  # -----------------------------
+  otel-collector:
+    profiles: ["observability"]
+    image: otel/opentelemetry-collector-contrib:0.129.0
+    container_name: platform-otel
+    restart: unless-stopped
+    networks: [platform]
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./infra/otel/config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"  # OTLP gRPC
+      - "4318:4318"  # OTLP HTTP
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v3.5.0
+    container_name: platform-prometheus
+    restart: unless-stopped
+    networks: [platform]
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:12.2.0
+    container_name: platform-grafana
+    restart: unless-stopped
+    networks: [platform]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
+networks:
+  platform:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  prometheus_data:
+  grafana_data:
